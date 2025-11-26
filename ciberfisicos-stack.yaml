@@ -1,0 +1,238 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Infraestructura mínima para proyecto Ciberfísicos: VPC, Subredes, NAT, EC2 privada, S3, CloudFront, IAM."
+
+Parameters:
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-x86_64
+    Description: "AMI más reciente de Amazon Linux 2023 (se adapta automáticamente a la región)."
+
+Resources:
+
+  # --------------------------
+  # VPC PRINCIPAL
+  # --------------------------
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: "10.0.0.0/16"
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: Ciberfisicos-VPC
+
+  # --------------------------
+  # SUBREDES
+  # --------------------------
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      CidrBlock: "10.0.1.0/24"
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: PublicSubnet-ciberfisicos
+
+  PrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      CidrBlock: "10.0.101.0/24"
+      Tags:
+        - Key: Name
+          Value: PrivateSubnet-ciberfisicos
+
+  # --------------------------
+  # INTERNET GATEWAY
+  # --------------------------
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: Ciberfisicos-IGW
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # --------------------------
+  # EIP PARA NAT
+  # --------------------------
+  NatEIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+
+  # --------------------------
+  # NAT GATEWAY
+  # --------------------------
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEIP.AllocationId
+      SubnetId: !Ref PublicSubnet
+
+  # --------------------------
+  # TABLAS DE RUTEO
+  # --------------------------
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: Public-RT
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: Private-RT
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: "0.0.0.0/0"
+      GatewayId: !Ref InternetGateway
+
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: "0.0.0.0/0"
+      NatGatewayId: !Ref NatGateway
+
+  AssociatePublicRT:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  AssociatePrivateRT:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet
+      RouteTableId: !Ref PrivateRouteTable
+
+  # --------------------------
+  # SECURITY GROUP EC2
+  # --------------------------
+  ECSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "Allow internal traffic only"
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: "10.0.0.0/16"
+
+  # --------------------------
+  # IAM ROLE PARA EC2
+  # --------------------------
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Tags:
+        - Key: Name
+          Value: EC2Role-Ciberfisicos
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref EC2Role
+
+  # --------------------------
+  # INSTANCIA EC2 PRIVADA
+  # --------------------------
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t3.micro
+      ImageId: !Ref LatestAmiId        # <--- AHORA VIENE DE SSM, NO HARÁ ERROR
+      SubnetId: !Ref PrivateSubnet
+      SecurityGroupIds:
+        - !Ref ECSecurityGroup
+      IamInstanceProfile: !Ref InstanceProfile
+      Tags:
+        - Key: Name
+          Value: EC2-Ciberfisicos
+
+  # --------------------------
+  # BUCKET S3 ESTÁTICO
+  # --------------------------
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "ciberfisicos-static-${AWS::AccountId}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Name
+          Value: Ciberfisicos-Static
+
+  # --------------------------
+  # CLOUDFRONT DISTRIBUTION
+  # --------------------------
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultRootObject: index.html
+        Origins:
+          - Id: S3Static
+            DomainName: !GetAtt S3Bucket.DomainName
+            S3OriginConfig: {}
+        DefaultCacheBehavior:
+          TargetOriginId: S3Static
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - GET
+            - HEAD
+          CachedMethods:
+            - GET
+            - HEAD
+          ForwardedValues:
+            QueryString: false
+            Cookies:
+              Forward: none
+
+Outputs:
+  VPCId:
+    Description: "ID de la VPC creada"
+    Value: !Ref VPC
+
+  CloudFrontDomain:
+    Description: "Dominio público de CloudFront"
+    Value: !GetAtt CloudFrontDistribution.DomainName
+
+  S3BucketName:
+    Description: "Nombre del bucket S3 estático"
+    Value: !Ref S3Bucket
